@@ -1,8 +1,10 @@
 package sentry
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
@@ -19,7 +21,6 @@ type unserializableType struct {
 	UnsupportedField func()
 }
 
-//nolint: lll
 const (
 	basicEvent                         = `{"message":"mkey","sdk":{},"user":{}}`
 	enhancedEventInvalidBreadcrumb     = `{"extra":{"info":"Could not encode original event as JSON. Succeeded by removing Breadcrumbs, Contexts and Extra. Please verify the data you attach to the scope. Error: json: error calling MarshalJSON for type *sentry.Event: json: error calling MarshalJSON for type *sentry.Breadcrumb: json: unsupported type: func()"},"message":"mkey","sdk":{},"user":{}}`
@@ -194,41 +195,12 @@ func TestGetRequestFromEvent(t *testing.T) {
 			if req.URL.String() != test.apiURL {
 				t.Errorf("Incorrect API URL. want: %s, got: %s", test.apiURL, req.URL.String())
 			}
+
+			if ua := req.UserAgent(); ua != userAgent {
+				t.Errorf("got User-Agent = %q, want %q", ua, userAgent)
+			}
 		})
 	}
-}
-
-func TestRetryAfterNoHeader(t *testing.T) {
-	r := http.Response{}
-	assertEqual(t, retryAfter(time.Now(), &r), time.Second*60)
-}
-
-func TestRetryAfterIncorrectHeader(t *testing.T) {
-	r := http.Response{
-		Header: map[string][]string{
-			"Retry-After": {"x"},
-		},
-	}
-	assertEqual(t, retryAfter(time.Now(), &r), time.Second*60)
-}
-
-func TestRetryAfterDelayHeader(t *testing.T) {
-	r := http.Response{
-		Header: map[string][]string{
-			"Retry-After": {"1337"},
-		},
-	}
-	assertEqual(t, retryAfter(time.Now(), &r), time.Second*1337)
-}
-
-func TestRetryAfterDateHeader(t *testing.T) {
-	now, _ := time.Parse(time.RFC1123, "Wed, 21 Oct 2015 07:28:00 GMT")
-	r := http.Response{
-		Header: map[string][]string{
-			"Retry-After": {"Wed, 21 Oct 2015 07:28:13 GMT"},
-		},
-	}
-	assertEqual(t, retryAfter(now, &r), time.Second*13)
 }
 
 // A testHTTPServer counts events sent to it. It requires a call to Unblock
@@ -461,4 +433,84 @@ func TestKeepAlive(t *testing.T) {
 	t.Run("SyncTransport", func(t *testing.T) {
 		testKeepAlive(t, NewHTTPSyncTransport())
 	})
+}
+
+func TestRateLimiting(t *testing.T) {
+	t.Run("AsyncTransport", func(t *testing.T) {
+		testRateLimiting(t, NewHTTPTransport())
+	})
+	t.Run("SyncTransport", func(t *testing.T) {
+		testRateLimiting(t, NewHTTPSyncTransport())
+	})
+}
+
+func testRateLimiting(t *testing.T, tr Transport) {
+	errorEvent := &Event{}
+	transactionEvent := &Event{Type: transactionType}
+
+	var errorEventCount, transactionEventCount uint64
+
+	writeRateLimits := func(w http.ResponseWriter, s string) {
+		w.Header().Add("Retry-After", "50")
+		w.Header().Add("X-Sentry-Rate-Limits", s)
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, `{"id":"636205708f6846c8821e6576a9d05921"}`)
+	}
+
+	// Test server that simulates responses with rate limits.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			panic(err)
+		}
+		if bytes.Contains(b, []byte("transaction")) {
+			atomic.AddUint64(&transactionEventCount, 1)
+			writeRateLimits(w, "20:transaction")
+		} else {
+			atomic.AddUint64(&errorEventCount, 1)
+			writeRateLimits(w, "50:error")
+		}
+	}))
+	defer srv.Close()
+
+	dsn := strings.Replace(srv.URL, "//", "//pubkey@", 1) + "/1"
+
+	tr.Configure(ClientOptions{
+		Dsn: dsn,
+	})
+
+	// Send several errors and transactions concurrently.
+	//
+	// Because the server always returns a rate limit for the payload type
+	// in the request, the expectation is that, for both errors and
+	// transactions, the first event is sent successfully, and then all
+	// others are discarded before hitting the server.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			tr.SendEvent(errorEvent)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			tr.SendEvent(transactionEvent)
+		}
+	}()
+	wg.Wait()
+
+	if !tr.Flush(time.Second) {
+		t.Fatal("Flush timed out")
+	}
+
+	// Only one event of each kind should have hit the transport, all other
+	// events discarded because of rate limiting.
+	if n := atomic.LoadUint64(&errorEventCount); n != 1 {
+		t.Errorf("got errorEvent = %d, want %d", n, 1)
+	}
+	if n := atomic.LoadUint64(&transactionEventCount); n != 1 {
+		t.Errorf("got transactionEvent = %d, want %d", n, 1)
+	}
 }
