@@ -1,6 +1,7 @@
 package sentry
 
 import (
+	"github.com/morikuni/failure"
 	"go/build"
 	"path/filepath"
 	"reflect"
@@ -51,8 +52,9 @@ func ExtractStacktrace(err error) *Stacktrace {
 	method := extractReflectedStacktraceMethod(err)
 
 	var pcs []uintptr
-
-	if method.IsValid() {
+	if uintptrs, ok := extractCallstacksFromFailure(err); ok {
+		pcs = uintptrs
+	} else if method.IsValid() {
 		pcs = extractPcs(method)
 	} else {
 		pcs = extractXErrorsPC(err)
@@ -70,6 +72,18 @@ func ExtractStacktrace(err error) *Stacktrace {
 	}
 
 	return &stacktrace
+}
+
+func extractCallstacksFromFailure(err error) ([]uintptr, bool) {
+	stack, ok := failure.CallStackOf(err)
+	if !ok {
+		return nil, false
+	}
+	uintptrs := make([]uintptr, 0, 30)
+	for _,  frame:= range stack.Frames() {
+		uintptrs = append(uintptrs, frame.PC())
+	}
+	return uintptrs, true
 }
 
 func extractReflectedStacktraceMethod(err error) reflect.Value {
